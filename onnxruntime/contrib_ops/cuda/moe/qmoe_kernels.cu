@@ -4338,8 +4338,14 @@ __global__ void __launch_bounds__(256, 3) Fc2GroupedFastKernel(
   }
 
   float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
-  if (sub_lane == 0 && params.fc2.bias) {
-    const T* b_ptr = static_cast<const T*>(params.fc2.bias) + w_row0;
+  if (sub_lane == 0 && params.fc2.bias && count > 0) {
+    const size_t route0 = static_cast<size_t>(s_routes[0]);
+    const size_t orig_route0 =
+        params.fc2_bias_route_ids ? static_cast<size_t>(__ldg(&params.fc2_bias_route_ids[route0])) : route0;
+    const int bias_exp_id =
+        params.fc2_bias_expert_indices ? __ldg(&params.fc2_bias_expert_indices[orig_route0]) : exp_id;
+    const T* b_ptr = static_cast<const T*>(params.fc2.bias) +
+                     static_cast<size_t>(bias_exp_id) * params.hidden + col0;
     b0 = static_cast<float>(b_ptr[0]);
     if (has_col1) b1 = static_cast<float>(b_ptr[1]);
     if (has_col2) b2 = static_cast<float>(b_ptr[2]);
