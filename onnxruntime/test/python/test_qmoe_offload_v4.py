@@ -131,8 +131,8 @@ def _cuda_malloc(cudart, nbytes: int, device_id: int = 0) -> ctypes.c_void_p:
     return ptr
 
 
-def _cuda_upload(cudart, device_ptr: ctypes.c_void_p, arr: np.ndarray) -> None:
-    arr = np.ascontiguousarray(arr, dtype=np.float32)
+def _cuda_upload(cudart, device_ptr: ctypes.c_void_p, arr: np.ndarray, dtype=np.float32) -> None:
+    arr = np.ascontiguousarray(arr, dtype=dtype)
     status = cudart.cudaMemcpy(device_ptr, arr.ctypes.data_as(ctypes.c_void_p), arr.nbytes, 1)  # cudaMemcpyHostToDevice
     if status != 0:
         raise RuntimeError(f"cudaMemcpy failed with status {status}")
@@ -3358,6 +3358,8 @@ int main() {
         rng = np.random.default_rng(33787)
         for bits, block, slot_bytes in ((4, 32, 110600), (2, 64, 55304)):
             with self.subTest(bits=bits), tempfile.TemporaryDirectory() as directory:
+                if bits == 4:
+                    self._skip_unless_int4_bf16_runner()
                 model = self._build_int_qmoe_model(directory, [(bits, block, 1)], hidden_size=512)
                 reference = self._make_session(model, {"session.moe.offload.mode": "disabled"})
                 resident = self._make_session(
@@ -3383,6 +3385,8 @@ int main() {
                 tempfile.TemporaryDirectory() as directory,
                 mock.patch.dict(os.environ, {"ORT_QMOE_SHARED_RESIDENT_LOG": "1"}),
             ):
+                if bits == 4:
+                    self._skip_unless_int4_bf16_runner()
                 model = self._build_int_qmoe_model(directory, [(bits, block, prepacked)], hidden_size=512)
                 x = np.random.default_rng(bits).standard_normal((16, 512), dtype=np.float32) * 0.5
                 router = np.tile(np.linspace(-4.0, 4.0, 8, dtype=np.float32), (16, 1))
@@ -3802,20 +3806,28 @@ int main() {
                     self.assertEqual(session.get_providers()[0], "CUDAExecutionProvider")
                     if cuda_graph:
                         self.assertTrue(use_fp16)
-                        x_value = ort.OrtValue.ortvalue_from_numpy(cases[0][0].astype(np.float16), "cuda", 0)
-                        r_value = ort.OrtValue.ortvalue_from_numpy(cases[0][1].astype(np.float16), "cuda", 0)
-                        y_value = ort.OrtValue.ortvalue_from_shape_and_type(cases[0][0].shape, np.float16, "cuda", 0)
-                        binding = session.io_binding()
-                        binding.bind_ortvalue_input("X", x_value)
-                        binding.bind_ortvalue_input("router_probs", r_value)
-                        binding.bind_ortvalue_output("Y", y_value)
-                        outputs = []
-                        for x, router in cases:
-                            x_value.update_inplace(x.astype(np.float16))
-                            r_value.update_inplace(router.astype(np.float16))
-                            session.run_with_iobinding(binding)
-                            outputs.append(y_value.numpy().astype(np.float32))
-                        del binding
+                        cudart = _load_cudart()
+                        self.assertIsNotNone(cudart, "CUDA runtime library is required for graph replay")
+                        device_id = self._device_id(self._selected_plugin_device())
+                        x_shape = list(cases[0][0].shape)
+                        r_shape = list(cases[0][1].shape)
+                        x_ptr = _cuda_malloc(cudart, int(np.prod(x_shape)) * 2, device_id)
+                        r_ptr = _cuda_malloc(cudart, int(np.prod(r_shape)) * 2, device_id)
+                        try:
+                            binding = session.io_binding()
+                            binding.bind_input("X", "cuda", device_id, np.float16, x_shape, x_ptr.value)
+                            binding.bind_input("router_probs", "cuda", device_id, np.float16, r_shape, r_ptr.value)
+                            binding.bind_output("Y", "cuda", device_id)
+                            outputs = []
+                            for x, router in cases:
+                                _cuda_upload(cudart, x_ptr, x, np.float16)
+                                _cuda_upload(cudart, r_ptr, router, np.float16)
+                                session.run_with_iobinding(binding)
+                                outputs.append(binding.copy_outputs_to_cpu()[0].astype(np.float32))
+                            del binding
+                        finally:
+                            cudart.cudaFree(x_ptr)
+                            cudart.cudaFree(r_ptr)
                     else:
                         run = self._run_fp16 if use_fp16 else self._run_bf16
                         outputs = [run(session, x, router) for x, router in cases]
