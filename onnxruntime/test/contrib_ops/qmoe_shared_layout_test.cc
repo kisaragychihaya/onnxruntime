@@ -2021,6 +2021,69 @@ TEST(QMoESharedLayoutTest, Int2SwiGluRoundsProjectionsBeforeBiasAndActivation) {
   }
 }
 
+TEST(QMoESharedLayoutTest, Int2Fp32SubnormalScaleDoesNotUnderflow) {
+  // Each product is 2^-149 * 2^126 = 2^-23, which is representable only if the scale is not pre-scaled below FP32's
+  // smallest subnormal.
+  constexpr int64_t hidden = 64, inter = 128;
+  const std::vector<uint8_t> weights(static_cast<size_t>(hidden * inter / 4), 0xFF);  // All weights are +1.
+  for (int64_t block : {32, 64, 128}) {
+    for (bool prepacked : {false, true}) {
+      const std::vector<float> scales(static_cast<size_t>(hidden * inter / block), 0x1p-149f);
+      shared::Int2ExpertView view{};
+      view.fc2_weights = weights.data();
+      view.fc2_scales = reinterpret_cast<const uint16_t*>(scales.data());
+      view.block_size = block;
+      view.weights_are_prepacked = prepacked;
+      view.scale_is_fp32 = true;
+      const std::vector<float> activations(static_cast<size_t>(inter), 0x1p126f);
+      std::vector<float> output(static_cast<size_t>(hidden));
+      shared::Int2Fc2Range(hidden, inter, view, activations.data(), 1, output.data(), 0, hidden,
+                           /*force_scalar=*/false, /*apply_bias=*/false);
+      for (float value : output) {
+        EXPECT_EQ(value, 0x1p-16f) << "block=" << block << " prepacked=" << prepacked;
+      }
+    }
+  }
+}
+
+TEST(QMoESharedLayoutTest, Int2SwiGluNegativeAlphaPositiveInfiniteGateIsZero) {
+  // FP16 projection rounding turns a gate of +80000 into +inf; with a negative alpha SiLU's limit is 0, not inf / inf.
+  constexpr int64_t hidden = 128, inter = 128, columns = 2 * inter, block = 64;
+  for (bool prepacked : {false, true}) {
+    std::vector<uint8_t> weights(static_cast<size_t>(columns * hidden / 4));
+    std::vector<uint16_t> scales(static_cast<size_t>(columns * hidden / block));
+    for (int64_t n = 0; n < columns; ++n) {
+      for (int64_t tile = 0; tile < hidden / 64; ++tile) {
+        const int64_t offset = prepacked ? (n / 8 * 2 * hidden + tile * 128 + n % 8 * 16) : (n * hidden / 4 + tile * 16);
+        std::fill_n(weights.data() + offset, 16, (n % 2 == 0) ? 0 : 0xFF);  // Gate weight -2, up weight +1.
+      }
+      std::fill_n(scales.data() + n * (hidden / block), hidden / block,
+                  shared::FloatToHalf((n % 2 == 0) ? 1.0f : 1e-6f));
+    }
+    shared::Int2ExpertView view{};
+    view.fc1_weights = weights.data();
+    view.fc1_scales = scales.data();
+    view.block_size = block;
+    view.weights_are_prepacked = prepacked;
+    std::vector<float> natural(static_cast<size_t>(hidden), 0.0f), reordered(natural.size());
+    natural[0] = -40000.0f;
+    if (prepacked) {
+      shared::ReorderInt2ActivationRow(natural.data(), reordered.data(), hidden);
+    } else {
+      shared::ReorderRawInt2ActivationRow(natural.data(), reordered.data(), hidden);
+    }
+    for (bool scalar : {false, true}) {
+      std::vector<float> output(static_cast<size_t>(inter));
+      shared::Int2Fc1SwiGluRange(hidden, inter, view, reordered.data(), 1,
+                                 {-1.0f, 0.0f, std::numeric_limits<float>::infinity()}, output.data(), 0, columns,
+                                 scalar, false, true);
+      for (float value : output) {
+        EXPECT_EQ(value, 0.0f) << "prepacked=" << prepacked << " scalar=" << scalar;
+      }
+    }
+  }
+}
+
 TEST(QMoESharedLayoutTest, Int2ExtremeBf16ScalesStayFinite) {
   // Code -2 times a BF16 scale of 2^127 or more overflows FP32 even when the activation is tiny, so the dispatcher must
   // route such ranges to the scalar kernel that halves the scale first.
