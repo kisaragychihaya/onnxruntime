@@ -28,7 +28,10 @@ permissions:
 jobs:
   webgpu-over-vulkan-linux:
     name: WebGPU EP on Vulkan (lavapipe)
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: ubuntu-latest has migrated to Ubuntu 26 (GCC 15), whose libstdc++
+    # <unicode> trips -Werror=maybe-uninitialized in logging.cc (a known GCC 15 false positive).
+    # GCC 14 also matches the upstream manylinux build image toolchain.
+    runs-on: ubuntu-24.04
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +49,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential ninja-build python3-pip ccache unzip
+            build-essential gcc-14 g++-14 ninja-build python3-pip ccache unzip
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+          gcc-14 --version | head -1
 
       - name: Install software Vulkan stack (Mesa lavapipe)
         run: |
@@ -60,14 +66,18 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: webgpu-vulkan-linux
+          key: webgpu-vulkan-linux-v2
           max-size: 5G
 
       - name: Build ONNX Runtime with WebGPU EP (Dawn Vulkan backend)
         timeout-minutes: 300
+        # --compile_no_warning_as_error: validation build, avoid -Werror false positives
+        # --skip_tests: we run the WebGPU gtest subset manually in a later step
         run: |
           ./build.sh --config Release --parallel --use_webgpu --use_cache \
             --build_dir build/vulkan_val \
+            --skip_tests \
+            --compile_no_warning_as_error \
             --cmake_extra_defines onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=ON
 
       - name: Post-build diagnostics
@@ -76,14 +86,16 @@ jobs:
           ls -lh build/vulkan_val/Release/onnxruntime_provider_test
           ccache --show-stats || true
 
-      - name: Verify Vulkan backend is compiled into libonnxruntime
+      - name: Verify Vulkan backend is compiled into the test binary
+        # NOTE: default build has build_shared_lib=False, so scan the test binary,
+        # which links Dawn (and its Vulkan backend) statically.
         run: |
-          so=$(ls build/vulkan_val/Release/libonnxruntime.so* | head -1)
-          echo "Scanning: $so"
+          bin=build/vulkan_val/Release/onnxruntime_provider_test
+          echo "Scanning: $bin"
           echo "--- Vulkan strings ---"
-          strings "$so" | grep -m 10 -i "vulkan" || echo "(no vulkan strings found)"
+          strings "$bin" | grep -m 10 -i "vulkan" || echo "(no vulkan strings found)"
           echo "--- SPIR-V strings ---"
-          strings "$so" | grep -m 10 -iE "spirv|spv" || echo "(no spirv strings found)"
+          strings "$bin" | grep -m 10 -iE "spirv|spv" || echo "(no spirv strings found)"
 
       - name: Count WebGPU test cases
         run: |
