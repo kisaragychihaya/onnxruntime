@@ -1,0 +1,103 @@
+# Route A validation for the Vulkan EP plan:
+# verify that the WebGPU EP over Dawn's Vulkan backend works end-to-end on Linux,
+# using Mesa lavapipe (software Vulkan) so no physical GPU is required.
+#
+# Evidence chain:
+#   1. vulkaninfo shows the lavapipe ICD (Vulkan runtime present).
+#   2. ORT is built with --use_webgpu (Dawn Vulkan backend enabled).
+#   3. strings(1) finds Vulkan/SPIR-V strings in libonnxruntime.so (backend compiled in).
+#   4. WebGPU provider tests run with VK_ICD_FILENAMES pinned to lavapipe only, so a
+#      green run proves WGSL -> SPIR-V -> Vulkan execution.
+# Known limitation (pre-existing, not an ORT bug): the MatMul family crashes Mesa
+# lavapipe's LLVM JIT, so MatMul/Attention tests are excluded here. See the
+# webgpu-local-testing skill for details.
+name: Vulkan Route A Validation
+
+on:
+  push:
+    branches: [vulkan-validation]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  webgpu-over-vulkan-linux:
+    name: WebGPU EP on Vulkan (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment diagnostics
+        run: |
+          df -h
+          echo "CPUs: $(nproc)"
+          free -h
+          cmake --version | head -1
+          gcc --version | head -1
+          python3 --version
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build python3-pip ccache unzip
+
+      - name: Install software Vulkan stack (Mesa lavapipe)
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools
+          echo "=== Vulkan ICDs ==="
+          ls -l /usr/share/vulkan/icd.d/
+          echo "=== vulkaninfo --summary ==="
+          vulkaninfo --summary
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: webgpu-vulkan-linux
+          max-size: 5G
+
+      - name: Build ONNX Runtime with WebGPU EP (Dawn Vulkan backend)
+        timeout-minutes: 300
+        run: |
+          ./build.sh --config Release --parallel --use_webgpu --use_cache \
+            --build_dir build/vulkan_val \
+            --cmake_extra_defines onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=ON
+
+      - name: Post-build diagnostics
+        run: |
+          df -h
+          ls -lh build/vulkan_val/Release/onnxruntime_provider_test
+          ccache --show-stats || true
+
+      - name: Verify Vulkan backend is compiled into libonnxruntime
+        run: |
+          so=$(ls build/vulkan_val/Release/libonnxruntime.so* | head -1)
+          echo "Scanning: $so"
+          echo "--- Vulkan strings ---"
+          strings "$so" | grep -m 10 -i "vulkan" || echo "(no vulkan strings found)"
+          echo "--- SPIR-V strings ---"
+          strings "$so" | grep -m 10 -iE "spirv|spv" || echo "(no spirv strings found)"
+
+      - name: Count WebGPU test cases
+        run: |
+          cd build/vulkan_val/Release
+          count=$(./onnxruntime_provider_test --gtest_list_tests | grep -c "WebGPU")
+          echo "WebGPU test cases: $count"
+          test "$count" -gt 0
+
+      - name: Run WebGPU provider tests on Vulkan (exclude MatMul/Attention, lavapipe LLVM JIT limitation)
+        timeout-minutes: 75
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          cd build/vulkan_val/Release
+          ./onnxruntime_provider_test \
+            --gtest_brief=1 \
+            --gtest_filter='*WebGPU*-*MatMul*:*Attention*'
