@@ -106,10 +106,15 @@ jobs:
 
       - name: Run WebGPU provider tests on Vulkan (exclude MatMul/Attention, lavapipe LLVM JIT limitation)
         timeout-minutes: 75
-        env:
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        # NOTE: Ubuntu's mesa package ships lvp_icd.json (no arch suffix); the
+        # lvp_icd.x86_64.json name is Fedora/RHEL-style. Resolve dynamically and
+        # re-verify vulkaninfo with the same env before running tests.
         run: |
           cd build/vulkan_val/Release
+          ICD_JSON=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+          echo "Using lavapipe ICD: $ICD_JSON"
+          export VK_ICD_FILENAMES="$ICD_JSON"
+          vulkaninfo --summary
           ./onnxruntime_provider_test \
             --gtest_brief=1 \
             --gtest_filter='*WebGPU*-*MatMul*:*Attention*'
