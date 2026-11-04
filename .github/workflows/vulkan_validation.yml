@@ -132,7 +132,9 @@ jobs:
   # (GitHub-hosted runners have no GPU; the Linux job above produces ELF binaries).
   webgpu-vulkan-windows-build:
     name: WebGPU EP Windows build (local GPU test artifacts)
-    runs-on: windows-latest
+    # windows-latest (Server 2025) ships no Visual Studio; windows-2022 has VS 2022.
+    # Upstream builds use self-hosted Azure pools with VS preinstalled instead.
+    runs-on: windows-2022
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
